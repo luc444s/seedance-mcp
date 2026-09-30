@@ -1,0 +1,21 @@
+# Credenciales — nunca deben entrar al repo
+.env
+.env.*
+!.env.example
+*.env
+seedance.env
+*seedance.env
+
+# Estado y artefactos locales
+state/
+runtime/
+*.log
+*.mp4
+*.mov
+*.png
+*.jpg
+*.wav
+*.mp3
+
+# Node
+node_modules/

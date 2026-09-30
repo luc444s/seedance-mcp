@@ -1,0 +1,33 @@
+name: audit
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # Falla el build si hay una credencial versionada.
+      - run: node scripts/audit-secrets.mjs
+
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: node --check scripts/seedance-mcp.mjs
+      - run: node --check scripts/r2.mjs
+      - run: bash -n scripts/install.sh
+      # El server debe anunciar sus tools sin necesitar credenciales.
+      - run: |
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            | node scripts/seedance-mcp.mjs \
+            | grep -q seedance_generate
