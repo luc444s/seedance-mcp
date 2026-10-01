@@ -16,7 +16,7 @@
 
 import { createInterface } from "node:readline";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { r2Upload, fetchBinary } from "./r2.mjs";
 
@@ -24,6 +24,9 @@ const API_KEY = process.env.SEEDANCE_API_KEY?.trim();
 const BASE_URL = (process.env.SEEDANCE_BASE_URL || "https://ark.ap-southeast.bytepluses.com").replace(/\/$/, "");
 const POLL_MAX = Number(process.env.SEEDANCE_POLL_MAX || 300);
 const STATE_DIR = process.env.SEEDANCE_STATE_DIR || "/tmp/seedance-mcp";
+// Donde se dejan los videos descargados para poder adjuntarlos al chat.
+const OUTBOX_DIR = process.env.SEEDANCE_OUTBOX_DIR || path.join(STATE_DIR, "videos");
+const KEEP_LOCAL = process.env.SEEDANCE_KEEP_LOCAL !== "false";
 const MODEL_DEFAULT = "dreamina-seedance-2-0-260128";
 
 // Cloudflare R2: las URLs de ByteDance expiran en 24h, asi que para conservar
@@ -68,6 +71,27 @@ function textResult(value) {
 function toolResult(value, isError = false) {
   const r = textResult(value);
   if (isError) r.isError = true;
+  return r;
+}
+
+/**
+ * Empaqueta el resultado con adjuntos estructurados para que el canal los
+ * renderice como media y no como texto.
+ *
+ * `content` es lo que lee el modelo; `details.media` es metadata de runtime que
+ * OpenClaw usa para entregar el archivo (ver docs/concepts/messages.md,
+ * "Tool result metadata"). Por eso el texto va en ambos lados: el agente debe
+ * poder razonar sobre la URL sin parsear la respuesta del canal.
+ *
+ * Se prefiere `path` sobre `url` cuando el archivo esta en disco: los canales
+ * como Discord y WhatsApp necesitan el binario para subirlo, y una URL firmada
+ * de 24h puede no ser accesible desde su lado.
+ */
+function mediaResult(value, media = []) {
+  const r = toolResult(value);
+  if (media.length) {
+    r.details = { media };
+  }
   return r;
 }
 
@@ -179,6 +203,38 @@ async function r2UploadLocal(filePath, keyPrefix) {
   return { publicUrl, key, bytes: data.length, contentType };
 }
 
+/**
+ * Prepara el video para entregarlo: lo deja en disco (para que el canal lo
+ * pueda subir) y devuelve el fact de media en el formato que OpenClaw espera
+ * (`PluginHookMediaFact`: path, url, contentType, kind).
+ *
+ * Sin esto el video vuelve como texto con una URL, que el usuario tiene que
+ * copiar a mano. Con esto aparece el reproductor en el chat y llega como
+ * archivo a Discord/WhatsApp.
+ */
+async function deliverableMedia(taskId, videoUrl) {
+  if (!KEEP_LOCAL || !videoUrl) return [];
+  try {
+    await mkdir(OUTBOX_DIR, { recursive: true });
+    const filePath = path.join(OUTBOX_DIR, `${taskId}.mp4`);
+    const data = await fetchBinary(videoUrl);
+    await writeFile(filePath, data);
+    return [
+      {
+        path: filePath,
+        url: videoUrl,
+        contentType: "video/mp4",
+        kind: "video",
+        workspaceDir: OUTBOX_DIR,
+      },
+    ];
+  } catch (err) {
+    // El video sigue siendo accesible por URL aunque no se pueda adjuntar.
+    process.stderr.write(`[seedance] no se pudo preparar el adjunto: ${err.message}\n`);
+    return [];
+  }
+}
+
 const TOOLS = [
   {
     name: "seedance_generate",
@@ -261,7 +317,10 @@ const TOOLS = [
           }
         }
       }
-      return toolResult(result);
+
+      const media = await deliverableMedia(task.id, result.videoUrl);
+      if (media.length) result.delivered = "El video viene adjuntado a este mensaje; no hace falta copiar la URL.";
+      return mediaResult(result, media);
     },
   },
   {
@@ -288,7 +347,10 @@ const TOOLS = [
     },
     handler: async ({ taskId, pollInterval = 5, maxSeconds = POLL_MAX }) => {
       const done = await waitForTask(taskId, pollInterval, maxSeconds);
-      return toolResult(describe(done));
+      const result = describe(done);
+      const media = await deliverableMedia(taskId, result.videoUrl);
+      if (media.length) result.delivered = "El video viene adjuntado a este mensaje; no hace falta copiar la URL.";
+      return mediaResult(result, media);
     },
   },
   {
@@ -317,7 +379,24 @@ const TOOLS = [
       const publicUrl = await r2Upload(data, objectKey, "video/mp4", R2);
       const prev = (await recordGet(String(taskId))) || {};
       await recordSave(String(taskId), { ...prev, id: String(taskId), archivedUrl: publicUrl, archivedAt: new Date().toISOString() });
-      return toolResult({ taskId, sourceUrl: videoUrl, publicUrl, key: objectKey, bytes: data.length });
+
+      // Ademas de publicar, deja el archivo en disco para adjuntarlo al chat.
+      let localPath;
+      if (KEEP_LOCAL) {
+        try {
+          await mkdir(OUTBOX_DIR, { recursive: true });
+          localPath = path.join(OUTBOX_DIR, `${path.basename(objectKey)}`);
+          await writeFile(localPath, data);
+        } catch {
+          /* la URL publica ya sirve */
+        }
+      }
+      const result = { taskId, publicUrl, key: objectKey, bytes: data.length, sourceUrl: videoUrl };
+      if (localPath) {
+        result.delivered = "El video viene adjuntado a este mensaje.";
+        return mediaResult(result, [{ path: localPath, url: publicUrl, contentType: "video/mp4", kind: "video", workspaceDir: OUTBOX_DIR }]);
+      }
+      return toolResult(result);
     },
   },
   {
@@ -502,7 +581,13 @@ async function handle(msg) {
         protocolVersion: params.protocolVersion || "2024-11-05",
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: "seedance-mcp", version: "1.0.0" },
-        instructions: `Generacion de video con Seedance 2.0 (ByteDance Ark). Escribe prompts en ingles, cinematograficos y concretos. Duracion 2-12s. Para image-to-video pasa una URL publica de imagen.`,
+        instructions:
+          `Generacion de video con Seedance 2.0 (ByteDance Ark). ` +
+          `Escribe prompts en ingles, cinematograficos y concretos. Duracion 2-12s. ` +
+          `Para image-to-video pasa una URL publica de imagen. ` +
+          `IMPORTANTE: cuando el resultado trae "delivered", el video ya viene adjunto al mensaje. ` +
+          `En ese caso responde con una frase corta y NO repitas la URL ni digas que expira, ` +
+          `porque el usuario no tiene que hacer nada para verlo.`,
       });
     case "notifications/initialized":
     case "notifications/cancelled":

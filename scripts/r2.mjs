@@ -70,7 +70,6 @@ export async function r2Upload(data, key, contentType, cfg) {
   const base = (publicUrl || `https://${host}`).replace(/\/$/, "");
   return `${base}/${key.split("/").map(encodeRfc3986).join("/")}`;
 }
-
 /** Descarga una URL remota a Buffer, con limite de tamano. */
 export async function fetchBinary(url, maxBytes = 200 * 1024 * 1024) {
   const res = await fetch(url);
