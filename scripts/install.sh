@@ -30,6 +30,18 @@ fi
 export OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
 STATE_DIR="${SEEDANCE_STATE_DIR:-$OPENCLAW_STATE_DIR}"
 
+# Donde OpenClaw deja los archivos que el usuario sube al chat. Permite que
+# seedance_upload resuelva un id de media a un path real sin que el agente
+# tenga que adivinar la ruta. Detecta el layout comun del gateway aislado.
+if [ -z "${OPENCLAW_MEDIA_DIR:-}" ]; then
+  for candidate in \
+    "$OPENCLAW_STATE_DIR/media/inbound" \
+    "$ROOT_DIR/../lesnaclaw/runtime/state/media/inbound" \
+    "$HOME/.openclaw/media/inbound"; do
+    if [ -d "$candidate" ]; then OPENCLAW_MEDIA_DIR="$candidate"; break; fi
+  done
+fi
+
 # --- carga de .env -----------------------------------------------------------
 # Lee una variable ignorando comentarios y comillas.
 load_env() {
@@ -79,6 +91,7 @@ MCP_ENV=(
   --env "SEEDANCE_BASE_URL=$SEEDANCE_BASE_URL"
   --env "SEEDANCE_STATE_DIR=$STATE_DIR"
 )
+[ -n "${OPENCLAW_MEDIA_DIR:-}" ] && MCP_ENV+=(--env "OPENCLAW_MEDIA_DIR=$OPENCLAW_MEDIA_DIR")
 
 R2_BUCKET_RESOLVED=""
 for var in "${R2_VARS[@]}"; do
@@ -93,6 +106,11 @@ for var in "${R2_VARS[@]}"; do
   [ "$var" = "R2_BUCKET" ] && R2_BUCKET_RESOLVED="$val"
 done
 
+if [ -n "${OPENCLAW_MEDIA_DIR:-}" ]; then
+  echo "[seedance] media de OpenClaw: $OPENCLAW_MEDIA_DIR"
+else
+  echo "[seedance] sin OPENCLAW_MEDIA_DIR; seedance_upload necesitara rutas absolutas"
+fi
 if [ -n "$R2_BUCKET_RESOLVED" ]; then
   echo "[seedance] R2 habilitado: bucket=$R2_BUCKET_RESOLVED"
 else
@@ -105,6 +123,7 @@ fi
   echo "SEEDANCE_API_KEY=$SEEDANCE_API_KEY"
   echo "SEEDANCE_BASE_URL=$SEEDANCE_BASE_URL"
   echo "SEEDANCE_STATE_DIR=$STATE_DIR"
+  [ -n "${OPENCLAW_MEDIA_DIR:-}" ] && echo "OPENCLAW_MEDIA_DIR=$OPENCLAW_MEDIA_DIR"
   if [ -n "$R2_BUCKET_RESOLVED" ]; then
     for var in "${R2_VARS[@]}"; do
       val="$(env_get "$var" || true)"

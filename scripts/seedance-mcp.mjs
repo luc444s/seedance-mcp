@@ -15,6 +15,9 @@
 //   SEEDANCE_POLL_MAX  (opcional) segundos max de espera, default 300
 
 import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { r2Upload, fetchBinary } from "./r2.mjs";
 
 const API_KEY = process.env.SEEDANCE_API_KEY?.trim();
@@ -126,6 +129,54 @@ function buildPrompt(prompt, opts) {
   if (opts.watermark !== undefined) flags.push(`--watermark ${opts.watermark}`);
   if (opts.seed !== undefined) flags.push(`--seed ${opts.seed}`);
   return flags.length ? `${prompt}  ${flags.join("  ")}` : prompt;
+}
+
+// Directorio donde OpenClaw deja los archivos que el usuario sube al chat.
+// Un path local no le sirve a ByteDance (sus servidores no ven tu disco), asi
+// que hay que publicarlo en R2 antes de usarlo como referencia.
+const OPENCLAW_MEDIA_DIR = process.env.OPENCLAW_MEDIA_DIR || "";
+
+const CONTENT_TYPES = {
+  ".mp4": "video/mp4",
+  ".mov": "video/quicktime",
+  ".webm": "video/webm",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".wav": "audio/wav",
+  ".mp3": "audio/mpeg",
+};
+
+/** Resuelve un input del usuario a un path absoluto legible. */
+function resolveInputPath(input) {
+  if (!input) return null;
+
+  // Si ya es un id de media de OpenClaw (o un path relativo media/inbound/...)
+  const bare = String(input).replace(/^\/+/, "").replace(/^media\/inbound\//, "");
+  if (OPENCLAW_MEDIA_DIR && /^[A-Za-z0-9_-]{8,}$/.test(bare)) {
+    const candidate = path.join(OPENCLAW_MEDIA_DIR, bare);
+    if (existsSync(candidate)) return candidate;
+  }
+  if (existsSync(input)) return path.resolve(input);
+  if (OPENCLAW_MEDIA_DIR) {
+    const candidate = path.join(OPENCLAW_MEDIA_DIR, bare);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function r2UploadLocal(filePath, keyPrefix) {
+  if (!R2_AVAILABLE) {
+    throw new Error("R2 no esta configurado. Define R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY y R2_BUCKET.");
+  }
+  const ext = path.extname(filePath).toLowerCase();
+  const contentType = CONTENT_TYPES[ext] || "application/octet-stream";
+  const data = await readFile(filePath);
+  const key = `${keyPrefix}${Date.now()}${ext}`;
+  const publicUrl = await r2Upload(data, key, contentType, R2);
+  return { publicUrl, key, bytes: data.length, contentType };
 }
 
 const TOOLS = [
@@ -267,6 +318,119 @@ const TOOLS = [
       const prev = (await recordGet(String(taskId))) || {};
       await recordSave(String(taskId), { ...prev, id: String(taskId), archivedUrl: publicUrl, archivedAt: new Date().toISOString() });
       return toolResult({ taskId, sourceUrl: videoUrl, publicUrl, key: objectKey, bytes: data.length });
+    },
+  },
+  {
+    name: "seedance_upload",
+    description:
+      "Sube un archivo local a Cloudflare R2 y devuelve su URL publica, para poder usarlo como referencia de Seedance. " +
+      "Sirve cuando el usuario adjunto un video o una imagen en el chat: OpenClaw los guarda en disco local y ByteDance no puede verlos. " +
+      "Acepta una ruta absoluta, un id de media de OpenClaw, o una URL http(s) que se descargue y se vuelva a publicar. " +
+      "Devuelve tambien un fragmento listo para pegar en prompt/videoUrl/videoUrls.",
+    inputSchema: {
+      type: "object",
+      required: ["source"],
+      properties: {
+        source: { type: "string", description: "Ruta local, id de media de OpenClaw, o URL publica" },
+        keyPrefix: { type: "string", default: "seedance/refs/", description: "Prefijo de la clave en R2" },
+        archive: { type: "boolean", default: false, description: "Noop: la subida a R2 ya es el archivado. Se acepta por simetria." },
+      },
+    },
+    handler: async ({ source, keyPrefix = "seedance/refs/" }) => {
+      if (!R2_AVAILABLE) {
+        return toolResult({ error: "R2 no esta configurado. Sin el no se puede publicar un archivo local." }, true);
+      }
+
+      // (a) URL publica: se puede pasar directo a Seedance, pero se re-publica
+      // para dejar una copia propia que no expire.
+      if (/^https?:\/\//i.test(source)) {
+        const data = await fetchBinary(source);
+        const ext = (new URL(source).pathname.match(/\.[a-z0-9]{2,5}$/i) || [".bin"])[0];
+        const publicUrl = await r2Upload(data, `${keyPrefix}${Date.now()}${ext}`, CONTENT_TYPES[ext.toLowerCase()] || "application/octet-stream", R2);
+        return toolResult({ source, publicUrl, bytes: data.length, note: "Descargado y republicado en R2." });
+      }
+
+      // (b) archivo local
+      const filePath = resolveInputPath(source);
+      if (!filePath) {
+        return toolResult(
+          {
+            error: `No encuentro el archivo: ${source}`,
+            hint: OPENCLAW_MEDIA_DIR
+              ? `Se busca en ${OPENCLAW_MEDIA_DIR} y tambien rutas absolutas.`
+              : "Define OPENCLAW_MEDIA_DIR para resolver ids de media de OpenClaw automaticamente.",
+          },
+          true
+        );
+      }
+      const { publicUrl, key, bytes, contentType } = await r2UploadLocal(filePath, keyPrefix);
+      return toolResult({
+        source: filePath,
+        publicUrl,
+        key,
+        bytes,
+        contentType,
+        usage: contentType.startsWith("video/") ? { videoUrls: [publicUrl] } : { imageUrl: publicUrl },
+        hint: contentType.startsWith("video/")
+          ? "Usar como videoUrls en seedance_generate (v2v)."
+          : "Usar como imageUrl en seedance_generate (i2v).",
+      });
+    },
+  },
+  {
+    name: "seedance_from_file",
+    description:
+      "Atajo: toma un archivo del chat (video o imagen), lo publica en R2 y genera un video nuevo de una sola llamada. " +
+      "Es la via recomendada cuando el usuario ya subio un archivo: sin publicar, ByteDance no puede leerlo. " +
+      "Para video usa v2v (tarda ~6 min); para imagen usa i2v (~1 min).",
+    inputSchema: {
+      type: "object",
+      required: ["prompt", "source"],
+      properties: {
+        prompt: { type: "string", description: "Instruccion de que cambiar. En v2v NO es una descripcion completa." },
+        source: { type: "string", description: "Ruta local, id de media de OpenClaw, o URL publica" },
+        resolution: { type: "string", enum: ["480p", "720p", "1080p"], default: "720p" },
+        duration: { type: "number", default: 5 },
+        ratio: { type: "string" },
+        generateAudio: { type: "boolean", default: true },
+        watermark: { type: "boolean", default: false },
+        wait: { type: "boolean", default: true },
+        pollInterval: { type: "number", default: 5 },
+      },
+    },
+    handler: async (args) => {
+      if (!R2_AVAILABLE) {
+        return toolResult({ error: "R2 no configurado; no se puede publicar el archivo local." }, true);
+      }
+
+      let ref;
+      let isVideo;
+      if (/^https?:\/\//i.test(args.source)) {
+        const isVideoUrl = /\.(mp4|mov|webm)(\?|$)/i.test(args.source);
+        ref = args.source;
+        isVideo = isVideoUrl;
+      } else {
+        const filePath = resolveInputPath(args.source);
+        if (!filePath) {
+          return toolResult(
+            { error: `No encuentro el archivo: ${args.source}`, hint: OPENCLAW_MEDIA_DIR ? `Buscando en ${OPENCLAW_MEDIA_DIR}` : "Define OPENCLAW_MEDIA_DIR." },
+            true
+          );
+        }
+        const up = await r2UploadLocal(filePath, "seedance/refs/");
+        ref = up.publicUrl;
+        isVideo = up.contentType.startsWith("video/");
+      }
+
+      const opts = { ...args };
+      if (isVideo) opts.videoUrls = [ref];
+      else opts.imageUrl = ref;
+
+      // Reutiliza la logica de generate sin duplicarla.
+      const generate = TOOLS.find((t) => t.name === "seedance_generate");
+      const result = await generate.handler(opts);
+      const parsed = JSON.parse(result.content[0].text);
+      return toolResult({ reference: ref, referenceType: isVideo ? "v2v" : "i2v", ...parsed });
     },
   },
   {

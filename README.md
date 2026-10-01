@@ -48,10 +48,34 @@ npm run audit
 | Tool | Qué hace |
 |---|---|
 | `seedance_generate` | Crea un video (t2v / i2v / **v2v**). `wait:true` espera y devuelve la URL. |
+| `seedance_from_file` | **Atajo**: publica un archivo del chat y genera en una sola llamada. |
+| `seedance_upload` | Publica un archivo local (o URL) en R2 y devuelve su URL. |
 | `seedance_status` | Consulta el estado de una tarea por id. |
 | `seedance_wait` | Espera a que una tarea termine y devuelve la URL. |
-| `seedance_archive` | Sube el video a Cloudflare R2 y devuelve una URL **permanente**. |
+| `seedance_archive` | Sube el video de una tarea a R2 (URL permanente). |
 | `seedance_list` | Lista las tareas registradas localmente. |
+
+## Por qué R2 es obligatorio en la práctica
+
+ByteDance corre en servidores remotos: cuando le mandás una URL, **ellos** la descargan. No pueden ver tu disco.
+
+OpenClaw guarda lo que subís al chat en `state/media/inbound/<id>`, y al agente le llega como **path local**. Ese path no le sirve a Seedance.
+
+Por eso el flujo es siempre:
+
+```
+1. Subís el archivo al chat   → state/media/inbound/abc.mp4   (local, invisible para ByteDance)
+2. seedance_upload            → https://aihopper.sihuen8.workers.dev/...
+3. seedance_generate          → ByteDance la descarga y funciona
+```
+
+`seedance_from_file` hace los pasos 2 y 3 juntos. Resuelve el path solo gracias a `OPENCLAW_MEDIA_DIR`, que el instalador detecta (`$OPENCLAW_STATE_DIR/media/inbound`).
+
+Ejemplo desde el chat:
+
+> "subí este video, hacé una versión en cámara lenta"
+
+El agente llama `seedance_from_file({ source: "abc123.mp4", prompt: "slow motion, camera push in" })` y listo.
 
 ## R2 (archivos permanentes)
 
